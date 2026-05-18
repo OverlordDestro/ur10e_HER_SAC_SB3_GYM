@@ -94,10 +94,11 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
     def _current_goal_pos(self):
         object0_pos = self.data.site("object0").xpos.copy()
         if self.stage == 0:
-            return self.hover_pos
+            return object0_pos
         elif self.stage == 1:
-            return object0_pos + np.array([0.0, 0.0, 0.05])
-        return self.data.body("target").xpos.copy()
+            return object0_pos
+        return object0_pos
+        #return self.data.body("target").xpos.copy()
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float64).copy()
@@ -111,28 +112,18 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
             raise ValueError(f"Expected action shape (4,) or (7,), got {action.shape}")
 
         cart_action = np.clip(cart_action, -1.0, 1.0) * self.cartesian_action_scale
-
-        # --- PROXIMITY SLOW-DOWN (approaches 1 & 2) ---
-        # Scale action magnitude down when close to the goal so the arm
-        # decelerates naturally near the target without changing the policy.
-        # Full speed beyond 0.20 m, tapers to 25 % at contact.
-        current_dist = float(np.linalg.norm(
-            self.data.site("UR10E_TCP").xpos - self._current_goal_pos()
-        ))
-        proximity_scale = float(np.clip(current_dist / 0.20, 0.25, 1.0))
-        cart_action = cart_action * proximity_scale
-
         # --- POSITION ERROR ---
         pos_error = cart_action
 
-        # --- ORIENTATION ERROR (keep TCP Z pointing down) ---
+        # --- ORIENTATION ERROR (HARDCODED TCP DOWN) ---
         flange_rot = self.data.site("UR10E_TCP").xmat.reshape(3, 3)
         current_z = flange_rot[:, 2]
-        desired_z = np.array([0, 0, -1])
+        desired_z = np.array([0.0, 0.0, -1.0])
 
-        rot_error = action[3:6] * 1
+        # force rotation toward downward Z
+        rot_error = np.cross(current_z, desired_z)
 
-        # Scale rotation (important!)
+        # keep your original gain style
         rot_gain = 0.5
         rot_error *= rot_gain
 
@@ -163,8 +154,7 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
             @ np.linalg.inv(jacobian @ jac_t + damping**2 * np.eye(6))
             @ target_delta_6d
         )
-        dynamic_max_delta = self.max_joint_delta * proximity_scale
-        joint_delta = np.clip(joint_delta, -dynamic_max_delta, dynamic_max_delta)
+        joint_delta = np.clip(joint_delta, -self.max_joint_delta, self.max_joint_delta)
 
         desired_qpos = self.data.qpos[:6].copy() + joint_delta
         desired_qpos = np.clip(desired_qpos, self.joint_lower_limits, self.joint_upper_limits)
@@ -174,15 +164,12 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
         ctrl[6] = np.clip((gripper_signal + 1.0) * 0.5 * 255.0, 0.0, 255.0)
 
         prev_achieved = self.data.site("UR10E_TCP").xpos.copy()
-        prev_desired = self._current_goal_pos()
-        self.prev_distance = float(np.linalg.norm(prev_achieved - prev_desired))
+        #prev_desired = self._current_goal_pos()
+        
 
-        if self.stage == 0:
-            distance = np.linalg.norm(self.data.site("UR10E_TCP").xpos - self.hover_pos)
-        elif self.stage == 1:
-            distance = np.linalg.norm(self.data.site("UR10E_TCP").xpos - (self.object0_pos + np.array([0, 0, 0.05])))
-        else:
-            distance = np.linalg.norm(self.data.site("UR10E_TCP").xpos - self.goal)
+
+        distance = np.linalg.norm(self.data.site("UR10E_TCP").xpos - self.object0_pos)
+
 
         self.do_simulation(ctrl, self.frame_skip)
         self.gripper_state = float(self.data.qpos[self._gripper_qpos_idx]) / 0.9  # normalize to [0, 1], assuming 0.9 is fully closed
@@ -201,6 +188,8 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
         flange_z = flange_rot[:, 2]
         z_dot = float(np.dot(flange_z, np.array([0, 0, -1])))
 
+        prev_desired = self.data.site("object0").xpos.copy()
+        self.prev_distance = float(np.linalg.norm(prev_achieved - prev_desired))
         # Build info BEFORE compute_reward so it can be passed in
         info = {
             "elbow_z":       self.elbow_z,
@@ -239,56 +228,28 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
 
         terminated = False
         gripper_open = self.gripper_state < 0.3
+        #print(distance, gripper_open)
         gripper_close = self.gripper_state > 0.45
         if self.stage == 0:
-            if distance < 0.06 and z_dot > 0.96 and gripper_open:
-                self.stage = 1
-
+            if distance < 0.04 and gripper_open:
+                self.stage = 1   
+                """terminated = True
+                self.episode_success = True
+                if self.no_early_termination:
+                    terminated = False"""
         elif self.stage == 1:
-            if distance < 0.02 and z_dot > 0.96 and gripper_close:
+            if gripper_close and self.object0_pos[2] > 0.05:
                 terminated = True
                 self.episode_success = True
                 if self.no_early_termination:
                     terminated = False
 
         elif self.stage == 2:
-            if distance < 0.02 and z_dot > 0.96 and gripper_close and self.object0_pos[2] > 0.05:
+            if distance < 0.02 and z_dot > 0.96 and gripper_close and self.object0_pos[2] > 0.2:
                 terminated = True
                 self.episode_success = True
                 if self.no_early_termination:
                     terminated = False
-            """if self.close_steps < 50:
-                # waiting phase: just close the gripper, don't move
-                self.close_steps += 1
-                # still reward gripper closing during wait
-                arm_vel = np.linalg.norm(self.data.qvel[:6])
-                reward = self.gripper_state * 1.0 - arm_vel * 0.1
-            else:
-                # after 50 steps of closing, start verifying the lift
-                self.grasp_verify_steps += 1
-                obj_xy_err = np.linalg.norm(self.object0_pos[:2] - ag_pos[:2])
-
-                if self.object0_pos[2] > 0.08 and gripper_close:
-                    if not self.grasp_verified:
-                        self.grasp_verified = True
-                        self.object_grasped = True
-                        reward += 10.0
-                    reward += max(0.0, 5.0 * (1.0 - obj_xy_err / 0.05))
-
-                    if self.object0_pos[2] > 0.15:
-                        self.episode_success = True
-                        reward += 10.0
-                        terminated = True
-                        if self.no_early_termination:
-                            terminated = False
-
-                elif self.grasp_verify_steps > 100:
-                    self.object_grasped = False
-                    self.grasp_verified = False
-                    self.stage = 1
-                    self.grasp_verify_steps = 0
-                    self.close_steps = 0
-                    reward -= 25.0"""
         else:
             print("Invalid stage:", self.stage)
             "so far the 2 stages are somewhat successful but at this point I also need to add stage 2 which will lift the box up towards the target"
@@ -313,58 +274,85 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
         return observation, reward, terminated, truncated, info
 
     def compute_reward(self, achieved_goal, desired_goal, info):
+        # This is the entry point for Stable Baselines3 HER
         total, _ = self._compute_reward_components(achieved_goal, desired_goal, info)
         return total
     
     def _compute_reward_components(self, achieved_goal, desired_goal, info):
-
-        # ── Unpack goals ──────────────────────────────────────────────────────
+        # 1. Unpack goals (supports both single vectors and batches)
         ag_pos = achieved_goal[..., :3]
         dg_pos = desired_goal[..., :3]
 
-        # ── Extract per-transition state from info ────────────────────────────
-        if isinstance(info, list):
-            prev_distance = np.array([i.get("prev_distance", 0.0) for i in info], dtype=np.float64)
-        else:
-            prev_distance = float(info.get("prev_distance", 0.0))
-
-        if isinstance(info, list):
+        # 2. Extract state from info (Handle single dict or list of dicts from HER)
+        if isinstance(info, (list, np.ndarray)):
+            # Batch mode (HER Replay)
+            # Use .get() with defaults to avoid KeyErrors during edge cases
             z_dot = np.array([i.get("z_dot", 0.0) for i in info])
-            object0_pos = np.array([i.get("object0_pos", 0.0) for i in info])
-            orientation_reward = (z_dot * 0.5 - 0.5) * 1.0
+            obj_pos = np.array([i.get("object0_pos", [0,0,0]) for i in info])
+            gripper_state = np.array([i.get("gripper_state", 0.0) for i in info])
+            stages = np.array([i.get("stage", 0) for i in info])
         else:
+            # Single mode (Live step)
             z_dot = info.get("z_dot", 0.0)
-            object0_pos = info.get("object0_pos", 0.0)
-            orientation_reward = (z_dot * 0.5 - 0.5) * 1.0
-        # ── Position reward ───────────────────────────────────────────────────
+            obj_pos = info.get("object0_pos", np.zeros(3))
+            gripper_state = info.get("gripper_state", 0.0)
+            stages = info.get("stage", 0)
 
-        diff_vec = ag_pos - dg_pos
-        dist_total = np.linalg.norm(diff_vec, axis=-1)
-
-        # Potential-based shaping: phi(s) = -distance
-        phi_prev = -prev_distance
-        phi_current = -dist_total
-        potential_reward = self.gamma * phi_current - phi_prev
-
+        # 3. Calculate distance-based reward
+        dist_total = np.linalg.norm(ag_pos - dg_pos, axis=-1)
         base_reward = -dist_total
-        if self.stage == 0:
-            reward = base_reward + orientation_reward + potential_reward
-        if self.stage == 1:
-            reward = base_reward * 1.1 + orientation_reward + potential_reward    
-        if self.stage == 2:
-            reward = base_reward + orientation_reward + potential_reward
-            if object0_pos[2] > 0.05:  # if the object is lifted off the table, give a big bonus
-                reward += 10.0  # bonus for lifting the object off the table
 
+        # 4. Gripper Rewards (penalties for being in the wrong state)
+        # We use np.minimum/maximum to ensure compatibility with both scalars and arrays
+        gripper_reward_open  = np.minimum(0.0, 0.2 - gripper_state) * 0.5
+        gripper_reward_close = np.minimum(0.0, gripper_state - 0.7) * 0.5
+
+        # 5. Calculate Final Reward using NumPy masking
+        # This replaces the "if stages == 0" logic which causes the ValueError
+        if isinstance(stages, np.ndarray):
+            reward = np.zeros_like(dist_total, dtype=np.float64)
+            
+            # Mask for Stage 0: Reach for box while keeping gripper open
+            mask0 = (stages == 0)
+            reward[mask0] = base_reward[mask0] + gripper_reward_open[mask0]
+            
+            # Mask for Stage 1: Close gripper and lift
+            mask1 = (stages == 1)
+            # Scaled bonus down to 2.0 to prevent Q-value explosion
+            lift_bonus = np.where(obj_pos[..., 2] > 0.05, 2.0, 0.0)
+            reward[mask1] = base_reward[mask1] + gripper_reward_close[mask1] + lift_bonus[mask1]
+            
+            # Mask for Stage 2: Move to target while holding box
+            mask2 = (stages == 2)
+            lift_bonus_s2 = np.where(obj_pos[..., 2] > 0.05, 1.0, 0.0)
+            reward[mask2] = base_reward[mask2] + lift_bonus_s2[mask2]
+        else:
+            # Scalar logic for the live environment step
+            if stages == 0:
+                reward = base_reward + gripper_reward_open
+            elif stages == 1:
+                object_height = max(0.0, obj_pos[2] - 0.025)
+                lift_reward = object_height * 80.0
+                reward = base_reward + gripper_reward_close + lift_reward
+                #reward = base_reward + gripper_reward_close
+                if obj_pos[2] > 0.05:
+                    reward += 2.0
+                    
+            else:
+                reward = base_reward
+                if obj_pos[2] > 0.05:
+                    reward += 1.0
+
+        # 6. Logging components (must return scalars for the info dict)
+        orientation_reward = (np.mean(z_dot) * 0.5 - 0.5)
         components = {
             "distance_reward": float(np.mean(base_reward)),
-            "potential_reward": float(np.mean(potential_reward)),
-            "orientation_reward": float(np.mean(orientation_reward)),
+            "orientation_reward": float(orientation_reward),
             "total_reward": float(np.mean(reward)),
+            "avg_stage": float(np.mean(stages))
         }
-        components_float = {k: float(v) for k, v in components.items()}
 
-        return reward, components_float
+        return reward, components
     #since gym 0.26, the step function should return (obs, reward, terminated, truncated, info) instead of (obs, reward, done, info) to distinguish between episode termination and truncation due to time limits or other factors.
     #I should use terminated to indicate if the episode ended due to success or failure, and truncated to indicate if it ended due to time limits or other factors. In this case, I will set terminated to False for now and rely on the TimeLimit wrapper to handle episode truncation after a certain number of steps.
 
@@ -392,28 +380,29 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
         object0_jnt_adr = self.model.body_jntadr[object0_id]
 
         #distance of the target from origin
+        x = self.np_random.uniform(low=-0.4, high=0.4, size=1)
+        y = self.np_random.uniform(low=0.5, high=0.8, size=1)
         while True:
             xy = self.np_random.uniform(low=-0.8, high=0.8, size=2)#distance of x y z from origin
-            z = self.np_random.uniform(low=0.2, high=0.7, size=1)
-
-            self.goal = np.concatenate([xy, z])#combine them together
+            #z = self.np_random.uniform(low=0.2, high=0.7, size=1)
+            z = np.array([0.3])
+            self.goal = np.concatenate([x, y, z])
             
             #donut shaped range
             dist = np.linalg.norm(self.goal[:2])
-            if 0.7 < dist < 1.0: 
-                break
+            break
         
         yaw  = self.np_random.uniform(0, 2 * np.pi)
         half = yaw / 2.0
         goal_quat = np.array([np.cos(half), 0.0, 0.0, np.sin(half)])  # wxyz
 
         while True:
-            xy2 = self.np_random.uniform(low=-0.8, high=0.8, size=2)
+            x2 = self.np_random.uniform(low=-0.2, high=0.4, size=1)
+            y2 = self.np_random.uniform(low=0.5, high=0.8, size=1)
             #z2  = self.np_random.uniform(low=0.025, high=0.025, size=1)
             z2 = np.array([0.025])  # fixed height for the object, can be adjusted as needed
-            object_pos = np.concatenate([xy2, z2])
-            if 0.3 < np.linalg.norm(object_pos[:2]) < 0.8:
-                break
+            object_pos = np.concatenate([x, y, z2])
+            break
         yaw2  = self.np_random.uniform(0, 2 * np.pi)
         half2 = yaw2 / 2.0
         object_quat = np.array([np.cos(half2), 0.0, 0.0, np.sin(half2)])
@@ -435,7 +424,7 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
 
         self.set_state(qpos, qvel)
         self.data.ctrl[:] = ctrl
-        self.prev_distance = float(np.linalg.norm(self.data.site("UR10E_TCP").xpos - self.hover_pos))
+        self.prev_distance = float(np.linalg.norm(self.data.site("UR10E_TCP").xpos - self.object0_pos))
 
         # Initialize prev_dist to the actual initial distance after setting the goal
         return self._get_obs()
@@ -453,8 +442,8 @@ class ur10eEnv(MujocoEnv, utils.EzPickle):
         object0_pos = self.data.site("object0").xpos.copy()
         if self.stage == 0:
             # hover point: object XY, object Z + 0.15
-            desired_pos = self.hover_pos
-            #desired_pos = object0_pos
+            #desired_pos = self.hover_pos
+            desired_pos = object0_pos
         elif self.stage == 1:
             # stage 1: reach the box itself
             desired_pos = object0_pos

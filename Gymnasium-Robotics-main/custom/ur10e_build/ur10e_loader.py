@@ -11,7 +11,7 @@ print("ur10e imported")
 env = gym.make("UR10E-v0", render_mode="human", max_episode_steps=500, no_early_termination=True)
 model = SAC.load("ur10e_checkpoint", env=env, device="cpu")
 #model = PPO.load("ur10e_checkpoint", env=env, device="cpu")
-observation, info = env.reset(seed=41) 
+observation, info = env.reset(seed=40) 
 
 component_names = [
     "xy_reward", "z_reward", "orientation_reward", "gripper_reward", "distance_reward","potential_reward"

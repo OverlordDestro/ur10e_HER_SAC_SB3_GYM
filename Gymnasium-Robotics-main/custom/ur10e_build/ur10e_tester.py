@@ -143,7 +143,7 @@ env = make_vec_env(make_env, n_envs=n_envs, vec_env_cls=DummyVecEnv, monitor_dir
 model = SAC(
     "MultiInputPolicy", 
     env, 
-    use_sde=True,  # Use State-Dependent Exploration for better smoothness
+    use_sde=False,  # Use State-Dependent Exploration for better smoothness
     sde_sample_freq=4,  # Sample a new noise value every 4 steps for smoother actions
     replay_buffer_class=HerReplayBuffer,
     replay_buffer_kwargs=dict(
